@@ -1,31 +1,107 @@
 """
 Async HTTP-Client für Patent-APIs.
 Nutzt USPTO PatentsView API (kostenlos, kein Key) als Hauptquelle.
+v0.2.0: Parallele Requests, In-Memory-Cache, erweiterte Suchmethoden.
 """
 
-import httpx
+import asyncio
+import hashlib
+import json
+import time
 from typing import Any
+
+import httpx
 
 from src.config import settings
 
 
+class SimpleCache:
+    """Einfacher In-Memory-Cache mit TTL und Max-Size."""
+
+    def __init__(self, max_size: int = 256, ttl: int = 600):
+        self._cache: dict[str, tuple[float, Any]] = {}
+        self._max_size = max_size
+        self._ttl = ttl
+
+    def _make_key(self, method: str, payload: dict) -> str:
+        """Erstellt einen deterministischen Cache-Key."""
+        raw = f"{method}:{json.dumps(payload, sort_keys=True)}"
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    def get(self, method: str, payload: dict) -> Any | None:
+        """Holt einen Eintrag aus dem Cache. None wenn nicht vorhanden oder abgelaufen."""
+        key = self._make_key(method, payload)
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        timestamp, value = entry
+        if time.time() - timestamp > self._ttl:
+            del self._cache[key]
+            return None
+        return value
+
+    def set(self, method: str, payload: dict, value: Any) -> None:
+        """Speichert einen Eintrag im Cache."""
+        # Aelteste Eintraege loeschen wenn Cache voll
+        if len(self._cache) >= self._max_size:
+            oldest_key = min(self._cache, key=lambda k: self._cache[k][0])
+            del self._cache[oldest_key]
+        key = self._make_key(method, payload)
+        self._cache[key] = (time.time(), value)
+
+    @property
+    def size(self) -> int:
+        return len(self._cache)
+
+
+# Globaler Cache
+_cache = SimpleCache(
+    max_size=settings.CACHE_MAX_SIZE,
+    ttl=settings.CACHE_TTL_SECONDS,
+)
+
+
 class PatentClient:
-    """Client für USPTO PatentsView API und ergänzende Quellen."""
+    """Client für USPTO PatentsView API mit Cache und parallelen Requests."""
 
     def __init__(self):
         self.patentsview_url = settings.PATENTSVIEW_API_URL
         self.timeout = settings.HTTP_TIMEOUT
+        self.cache_enabled = settings.CACHE_ENABLED
 
     def _get_client(self) -> httpx.AsyncClient:
         """Erstellt einen neuen async HTTP-Client."""
         return httpx.AsyncClient(
             timeout=self.timeout,
             headers={
-                "User-Agent": "patent-intelligence-mcp-server/0.1.0",
+                "User-Agent": f"patent-intelligence-mcp-server/{settings.VERSION}",
                 "Content-Type": "application/json",
             },
             follow_redirects=True,
         )
+
+    async def _post(
+        self, client: httpx.AsyncClient, endpoint: str, payload: dict
+    ) -> dict[str, Any]:
+        """POST-Request mit optionalem Caching."""
+        # Cache prüfen
+        if self.cache_enabled:
+            cached = _cache.get(endpoint, payload)
+            if cached is not None:
+                return cached
+
+        response = await client.post(
+            f"{self.patentsview_url}{endpoint}",
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        # Im Cache speichern
+        if self.cache_enabled:
+            _cache.set(endpoint, payload, data)
+
+        return data
 
     async def search_patents(
         self,
@@ -33,21 +109,35 @@ class PatentClient:
         limit: int = 10,
         sort_by: str = "patent_date",
         sort_order: str = "desc",
+        date_from: str | None = None,
+        date_to: str | None = None,
     ) -> dict[str, Any]:
         """
         Sucht Patente über die PatentsView API.
         Nutzt Volltextsuche über Titel und Abstract.
+        Optional mit Datumsfilter.
         """
         limit = min(limit, settings.MAX_LIMIT)
 
-        # PatentsView API v1 Query-Format
+        # Query aufbauen
+        text_query = {
+            "_or": [
+                {"_text_any": {"patent_title": query}},
+                {"_text_any": {"patent_abstract": query}},
+            ]
+        }
+
+        # Datumsfilter hinzufügen wenn angegeben
+        conditions = [text_query]
+        if date_from:
+            conditions.append({"_gte": {"patent_date": date_from}})
+        if date_to:
+            conditions.append({"_lte": {"patent_date": date_to}})
+
+        q = {"_and": conditions} if len(conditions) > 1 else text_query
+
         payload = {
-            "q": {
-                "_or": [
-                    {"_text_any": {"patent_title": query}},
-                    {"_text_any": {"patent_abstract": query}},
-                ]
-            },
+            "q": q,
             "f": [
                 "patent_number",
                 "patent_title",
@@ -61,26 +151,21 @@ class PatentClient:
                 "per_page": limit,
                 "matched_subentities_only": True,
             },
-            "s": [{"patent_date": sort_order}],
+            "s": [{sort_by: sort_order}],
         }
 
         async with self._get_client() as client:
-            response = await client.post(
-                f"{self.patentsview_url}/patents/query",
-                json=payload,
-            )
-            response.raise_for_status()
-            return response.json()
+            return await self._post(client, "/patents/query", payload)
 
     async def get_patent_details(self, patent_number: str) -> dict[str, Any]:
         """
         Holt detaillierte Infos zu einem einzelnen Patent.
-        Inklusive Erfinder, Assignee, Claims, Klassifikation.
+        Nutzt parallele Requests für Erfinder, Assignee, CPC.
         """
-        # Nummer bereinigen (Bindestriche/Leerzeichen entfernen)
         clean_number = patent_number.strip().replace("-", "").replace(" ", "")
 
-        payload = {
+        # Basis-Payload
+        base_payload = {
             "q": {"patent_number": clean_number},
             "f": [
                 "patent_number",
@@ -100,72 +185,66 @@ class PatentClient:
             "o": {"matched_subentities_only": True},
         }
 
+        inventor_payload = {
+            "q": {"patent_number": clean_number},
+            "f": [
+                "inventor_first_name",
+                "inventor_last_name",
+                "inventor_city",
+                "inventor_state",
+                "inventor_country",
+            ],
+        }
+
+        assignee_payload = {
+            "q": {"patent_number": clean_number},
+            "f": [
+                "assignee_organization",
+                "assignee_first_name",
+                "assignee_last_name",
+                "assignee_type",
+                "assignee_country",
+            ],
+        }
+
+        cpc_payload = {
+            "q": {"patent_number": clean_number},
+            "f": [
+                "cpc_section_id",
+                "cpc_subsection_id",
+                "cpc_subsection_title",
+                "cpc_group_id",
+                "cpc_group_title",
+            ],
+        }
+
         async with self._get_client() as client:
-            # Patent-Basis-Daten
-            response = await client.post(
-                f"{self.patentsview_url}/patents/query",
-                json=payload,
-            )
-            response.raise_for_status()
-            patent_data = response.json()
-
-            # Erfinder abrufen
-            inventor_payload = {
-                "q": {"patent_number": clean_number},
-                "f": [
-                    "inventor_first_name",
-                    "inventor_last_name",
-                    "inventor_city",
-                    "inventor_state",
-                    "inventor_country",
-                ],
-            }
-            inv_response = await client.post(
-                f"{self.patentsview_url}/inventors/query",
-                json=inventor_payload,
+            # Alle 4 Requests parallel ausfuehren
+            results = await asyncio.gather(
+                self._post(client, "/patents/query", base_payload),
+                self._safe_post(client, "/inventors/query", inventor_payload),
+                self._safe_post(client, "/assignees/query", assignee_payload),
+                self._safe_post(client, "/cpc_subsections/query", cpc_payload),
             )
 
-            # Assignees abrufen
-            assignee_payload = {
-                "q": {"patent_number": clean_number},
-                "f": [
-                    "assignee_organization",
-                    "assignee_first_name",
-                    "assignee_last_name",
-                    "assignee_type",
-                    "assignee_country",
-                ],
-            }
-            asg_response = await client.post(
-                f"{self.patentsview_url}/assignees/query",
-                json=assignee_payload,
-            )
+            patent_data = results[0]
+            if results[1]:
+                patent_data["inventors"] = results[1]
+            if results[2]:
+                patent_data["assignees"] = results[2]
+            if results[3]:
+                patent_data["cpc_classifications"] = results[3]
 
-            # CPC-Klassifikation abrufen
-            cpc_payload = {
-                "q": {"patent_number": clean_number},
-                "f": [
-                    "cpc_section_id",
-                    "cpc_subsection_id",
-                    "cpc_subsection_title",
-                    "cpc_group_id",
-                    "cpc_group_title",
-                ],
-            }
-            cpc_response = await client.post(
-                f"{self.patentsview_url}/cpc_subsections/query",
-                json=cpc_payload,
-            )
+            return patent_data
 
-            result = patent_data
-            if inv_response.status_code == 200:
-                result["inventors"] = inv_response.json()
-            if asg_response.status_code == 200:
-                result["assignees"] = asg_response.json()
-            if cpc_response.status_code == 200:
-                result["cpc_classifications"] = cpc_response.json()
-
-            return result
+    async def _safe_post(
+        self, client: httpx.AsyncClient, endpoint: str, payload: dict
+    ) -> dict[str, Any] | None:
+        """POST-Request der bei Fehlern None zurückgibt statt Exception."""
+        try:
+            return await self._post(client, endpoint, payload)
+        except Exception:
+            return None
 
     async def search_by_inventor(
         self, inventor_name: str, limit: int = 10
@@ -176,7 +255,6 @@ class PatentClient:
         """
         limit = min(limit, settings.MAX_LIMIT)
 
-        # Name aufteilen falls möglich
         parts = inventor_name.strip().split()
         if len(parts) >= 2:
             query = {
@@ -207,19 +285,12 @@ class PatentClient:
         }
 
         async with self._get_client() as client:
-            response = await client.post(
-                f"{self.patentsview_url}/patents/query",
-                json=payload,
-            )
-            response.raise_for_status()
-            return response.json()
+            return await self._post(client, "/patents/query", payload)
 
     async def search_by_assignee(
         self, company_name: str, limit: int = 10
     ) -> dict[str, Any]:
-        """
-        Sucht Patente eines bestimmten Unternehmens/Assignees.
-        """
+        """Sucht Patente eines bestimmten Unternehmens/Assignees."""
         limit = min(limit, settings.MAX_LIMIT)
 
         payload = {
@@ -241,130 +312,150 @@ class PatentClient:
         }
 
         async with self._get_client() as client:
-            response = await client.post(
-                f"{self.patentsview_url}/patents/query",
-                json=payload,
-            )
-            response.raise_for_status()
-            return response.json()
+            return await self._post(client, "/patents/query", payload)
+
+    async def search_by_cpc(
+        self, cpc_code: str, limit: int = 10
+    ) -> dict[str, Any]:
+        """
+        Sucht Patente nach CPC-Klassifikationscode.
+        z.B. "H01L" (Halbleiter), "G06F" (Datenverarbeitung), "A61K" (Pharma).
+        """
+        limit = min(limit, settings.MAX_LIMIT)
+
+        # CPC-Code kann Section (H), Subsection (H01) oder Group (H01L) sein
+        code = cpc_code.strip().upper()
+
+        if len(code) <= 1:
+            # Section-Ebene (z.B. "H")
+            q = {"cpc_section_id": code}
+        elif len(code) <= 3:
+            # Subsection-Ebene (z.B. "H01")
+            q = {"cpc_subsection_id": code}
+        else:
+            # Group-Ebene (z.B. "H01L" oder "H01L21")
+            q = {"_text_any": {"cpc_group_id": code}}
+
+        payload = {
+            "q": q,
+            "f": [
+                "patent_number",
+                "patent_title",
+                "patent_date",
+                "patent_abstract",
+                "cpc_subsection_id",
+                "cpc_subsection_title",
+                "cpc_group_id",
+                "patent_num_claims",
+            ],
+            "o": {
+                "page": 1,
+                "per_page": limit,
+                "matched_subentities_only": True,
+            },
+            "s": [{"patent_date": "desc"}],
+        }
+
+        async with self._get_client() as client:
+            return await self._post(client, "/cpc_subsections/query", payload)
 
     async def get_patent_citations(
         self, patent_number: str
     ) -> dict[str, Any]:
         """
         Holt Zitationsnetzwerk eines Patents.
-        Zeigt sowohl zitierte als auch zitierende Patente.
+        Nutzt parallele Requests für zitierte und zitierende Patente.
         """
         clean_number = patent_number.strip().replace("-", "").replace(" ", "")
 
+        cited_payload = {
+            "q": {"patent_number": clean_number},
+            "f": [
+                "patent_number",
+                "patent_title",
+                "patent_date",
+                "cited_patent_number",
+                "cited_patent_title",
+                "cited_patent_date",
+                "cited_patent_category",
+            ],
+            "o": {"per_page": 100},
+        }
+
+        citing_payload = {
+            "q": {"cited_patent_number": clean_number},
+            "f": [
+                "patent_number",
+                "patent_title",
+                "patent_date",
+                "patent_abstract",
+            ],
+            "o": {"per_page": 50},
+            "s": [{"patent_date": "desc"}],
+        }
+
         async with self._get_client() as client:
-            # Zitierte Patente (was dieses Patent zitiert)
-            cited_payload = {
-                "q": {"patent_number": clean_number},
-                "f": [
-                    "patent_number",
-                    "patent_title",
-                    "patent_date",
-                    "cited_patent_number",
-                    "cited_patent_title",
-                    "cited_patent_date",
-                    "cited_patent_category",
-                ],
-                "o": {"per_page": 100},
-            }
-            cited_response = await client.post(
-                f"{self.patentsview_url}/patents/query",
-                json=cited_payload,
+            # Parallel ausfuehren
+            cited_result, citing_result = await asyncio.gather(
+                self._safe_post(client, "/patents/query", cited_payload),
+                self._safe_post(client, "/patents/query", citing_payload),
             )
 
-            # Zitierende Patente (wer dieses Patent zitiert)
-            citing_payload = {
-                "q": {"cited_patent_number": clean_number},
-                "f": [
-                    "patent_number",
-                    "patent_title",
-                    "patent_date",
-                    "patent_abstract",
-                ],
-                "o": {"per_page": 50},
-                "s": [{"patent_date": "desc"}],
-            }
-            citing_response = await client.post(
-                f"{self.patentsview_url}/patents/query",
-                json=citing_payload,
-            )
-
-            result = {
+            return {
                 "patent_number": clean_number,
-                "cited_by_this_patent": {},
-                "patents_citing_this": {},
+                "cited_by_this_patent": cited_result or {},
+                "patents_citing_this": citing_result or {},
             }
-
-            if cited_response.status_code == 200:
-                result["cited_by_this_patent"] = cited_response.json()
-            if citing_response.status_code == 200:
-                result["patents_citing_this"] = citing_response.json()
-
-            return result
 
     async def get_patent_counts_by_year(
         self, query: str, start_year: int, end_year: int
     ) -> list[dict[str, Any]]:
         """
-        Holt Patent-Anmeldezahlen pro Jahr für eine Technologie.
-        Wird für Trendanalysen genutzt.
+        Holt Patent-Anmeldezahlen pro Jahr — PARALLEL statt sequentiell.
+        Massiv schneller als v0.1.0.
         """
-        results = []
+
+        async def _count_for_year(
+            client: httpx.AsyncClient, year: int
+        ) -> dict[str, Any]:
+            """Einzelne Jahres-Abfrage."""
+            payload = {
+                "q": {
+                    "_and": [
+                        {
+                            "_or": [
+                                {"_text_any": {"patent_title": query}},
+                                {"_text_any": {"patent_abstract": query}},
+                            ]
+                        },
+                        {"_gte": {"patent_date": f"{year}-01-01"}},
+                        {"_lte": {"patent_date": f"{year}-12-31"}},
+                    ]
+                },
+                "f": ["patent_number"],
+                "o": {"page": 1, "per_page": 1},
+            }
+            try:
+                data = await self._post(client, "/patents/query", payload)
+                count = data.get("total_patent_count", 0)
+            except Exception:
+                count = 0
+            return {"year": year, "patent_count": count}
 
         async with self._get_client() as client:
-            for year in range(start_year, end_year + 1):
-                payload = {
-                    "q": {
-                        "_and": [
-                            {
-                                "_or": [
-                                    {"_text_any": {"patent_title": query}},
-                                    {"_text_any": {"patent_abstract": query}},
-                                ]
-                            },
-                            {
-                                "_gte": {
-                                    "patent_date": f"{year}-01-01"
-                                }
-                            },
-                            {
-                                "_lte": {
-                                    "patent_date": f"{year}-12-31"
-                                }
-                            },
-                        ]
-                    },
-                    "f": ["patent_number"],
-                    "o": {"page": 1, "per_page": 1},
-                }
+            # Alle Jahre parallel abfragen
+            tasks = [
+                _count_for_year(client, year)
+                for year in range(start_year, end_year + 1)
+            ]
+            results = await asyncio.gather(*tasks)
 
-                try:
-                    response = await client.post(
-                        f"{self.patentsview_url}/patents/query",
-                        json=payload,
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    count = data.get("total_patent_count", 0)
-                except Exception:
-                    count = 0
-
-                results.append({"year": year, "patent_count": count})
-
-        return results
+        return sorted(results, key=lambda x: x["year"])
 
     async def get_top_assignees_for_query(
         self, query: str, limit: int = 10
     ) -> dict[str, Any]:
-        """
-        Holt die Top-Assignees für eine bestimmte Technologie.
-        Hilfreich für Wettbewerbsanalyse.
-        """
+        """Holt die Top-Assignees für eine bestimmte Technologie."""
         limit = min(limit, settings.MAX_LIMIT)
 
         payload = {
@@ -387,12 +478,59 @@ class PatentClient:
         }
 
         async with self._get_client() as client:
-            response = await client.post(
-                f"{self.patentsview_url}/assignees/query",
-                json=payload,
-            )
-            response.raise_for_status()
-            return response.json()
+            return await self._post(client, "/assignees/query", payload)
+
+    async def get_assignee_patent_count(
+        self, company_name: str
+    ) -> int:
+        """Holt die Gesamtanzahl Patente eines Unternehmens."""
+        payload = {
+            "q": {"_text_any": {"assignee_organization": company_name}},
+            "f": ["patent_number"],
+            "o": {"page": 1, "per_page": 1},
+        }
+
+        async with self._get_client() as client:
+            try:
+                data = await self._post(client, "/patents/query", payload)
+                return data.get("total_patent_count", 0)
+            except Exception:
+                return 0
+
+    async def get_assignee_yearly_counts(
+        self, company_name: str, start_year: int, end_year: int
+    ) -> list[dict[str, Any]]:
+        """Holt Patent-Anmeldezahlen pro Jahr fuer ein Unternehmen — parallel."""
+
+        async def _count_year(
+            client: httpx.AsyncClient, year: int
+        ) -> dict[str, Any]:
+            payload = {
+                "q": {
+                    "_and": [
+                        {"_text_any": {"assignee_organization": company_name}},
+                        {"_gte": {"patent_date": f"{year}-01-01"}},
+                        {"_lte": {"patent_date": f"{year}-12-31"}},
+                    ]
+                },
+                "f": ["patent_number"],
+                "o": {"page": 1, "per_page": 1},
+            }
+            try:
+                data = await self._post(client, "/patents/query", payload)
+                count = data.get("total_patent_count", 0)
+            except Exception:
+                count = 0
+            return {"year": year, "patent_count": count}
+
+        async with self._get_client() as client:
+            tasks = [
+                _count_year(client, year)
+                for year in range(start_year, end_year + 1)
+            ]
+            results = await asyncio.gather(*tasks)
+
+        return sorted(results, key=lambda x: x["year"])
 
 
 # Globale Client-Instanz
