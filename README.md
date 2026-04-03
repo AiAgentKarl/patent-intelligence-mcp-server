@@ -7,7 +7,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
 
-MCP server that gives AI agents access to US patent data. **10 tools** for patent search, citation networks, technology trend analysis, CPC classification lookup, company portfolio comparison, and technology landscape mapping — all through the free USPTO PatentsView API.
+MCP server that gives AI agents access to US patent data. **16 tools** for patent search, citation networks, technology trend analysis, IPC/CPC classification, patent families, claims extraction, top holder rankings, portfolio comparison, and strategic landscape analysis — all through the free USPTO PatentsView API.
 
 ## Features
 
@@ -20,9 +20,23 @@ MCP server that gives AI agents access to US patent data. **10 tools** for paten
 | `get_patent_citations` | Citation networks with impact scoring |
 | `analyze_technology_trends` | Patent filing trends over time with growth rates |
 | `search_by_cpc` | Search by CPC classification code (e.g. G06N for AI/ML) |
-| `search_recent_patents` | Find the newest patents in a technology area |
+| `search_recent_patents` | Find newest patents with optional category filter (pharma, AI, etc.) |
 | `compare_portfolios` | Head-to-head comparison of two companies' patent portfolios |
-| `get_patent_landscape` | Full technology landscape: trends, top players, competition intensity |
+| `get_patent_landscape` | Technology landscape: trends, top players, CPC + geographic distribution |
+| `search_by_classification` | Search by IPC/CPC code at subgroup level for precise research |
+| `get_patent_family` | Find related patents (continuations, divisionals) in the same family |
+| `get_top_patent_holders` | Ranking of companies by patent count, filterable by sector |
+| `analyze_patent_landscape` | Strategic landscape analysis with insights and recommendations |
+| `get_patent_claims` | Extract patent claims (the legally binding part) |
+
+### What's New in v0.3.0
+
+- **5 new tools**: Classification search (IPC/CPC subgroup), patent families, top holder rankings, strategic landscape analysis, claims extraction
+- **Enhanced search_recent_patents**: Category filter (pharma, AI, telecom, energy, etc.)
+- **Enhanced get_patent_landscape**: Now includes CPC distribution and geographic distribution
+- **Enhanced get_patent_details**: Suggests related tools (citations, claims, family)
+- **Strategic insights**: analyze_patent_landscape generates actionable recommendations
+- **10 sector presets**: pharma, tech, semiconductor, telecom, automotive, energy, biotech, AI, medical, aerospace
 
 ### What's New in v0.2.0
 
@@ -85,6 +99,14 @@ Once connected, your AI agent can answer questions like:
 - "Analyze patent trends in CRISPR technology over 10 years"
 - "How does Google's patent portfolio compare to Microsoft's?"
 
+**New in v0.3.0:**
+- "Search patents in IPC classification H04L9/32 (cryptographic authentication)"
+- "Find the patent family for patent 11234567"
+- "Who are the top patent holders in the pharma sector?"
+- "Give me a strategic landscape analysis for quantum computing"
+- "Extract the claims for patent 11234567"
+- "Show me recent AI patents from the last 30 days"
+
 ## CPC Classification Codes
 
 Common codes for the `search_by_cpc` tool:
@@ -118,11 +140,11 @@ Optional environment variables:
 
 ## Performance
 
-v0.2.0 includes significant performance improvements:
-
 - **Parallel requests**: Patent details fetch 4 data sources simultaneously instead of sequentially
 - **Trend analysis**: Year-by-year queries run in parallel (5-year analysis: ~1 request time instead of ~5)
+- **Landscape analysis**: 5 parallel API calls for comprehensive results in a single request cycle
 - **In-memory caching**: Repeated queries return from cache (256 entries, 10-minute TTL)
+- **Patent families**: Parallel citation + base patent lookups
 
 ## Related MCP Servers
 

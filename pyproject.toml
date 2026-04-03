@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "patent-intelligence-mcp-server"
-version = "0.2.0"
-description = "MCP server providing AI agents with access to patent data — 10 tools for patent search, citation networks, trend analysis, CPC classification, portfolio comparison and technology landscapes via USPTO PatentsView API"
+version = "0.3.0"
+description = "MCP server providing AI agents with access to patent data — 16 tools for patent search, citation networks, trend analysis, IPC/CPC classification, patent families, claims extraction, top holder rankings, landscape analysis and strategic insights via USPTO PatentsView API"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -16,7 +16,9 @@ keywords = [
     "mcp", "patents", "uspto", "intellectual-property",
     "patent-search", "ai-agent", "model-context-protocol",
     "patent-analytics", "technology-trends", "cpc-classification",
-    "patent-landscape", "portfolio-comparison", "citation-network"
+    "patent-landscape", "portfolio-comparison", "citation-network",
+    "patent-family", "patent-claims", "ipc-classification",
+    "competitive-intelligence", "ip-analytics"
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

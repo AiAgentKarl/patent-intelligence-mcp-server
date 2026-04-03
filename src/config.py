@@ -27,7 +27,7 @@ class Settings:
     CACHE_TTL_SECONDS: int = 600  # 10 Minuten
 
     # Version
-    VERSION: str = "0.2.0"
+    VERSION: str = "0.3.0"
 
 
 def load_settings() -> Settings:

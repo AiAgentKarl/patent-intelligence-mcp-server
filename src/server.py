@@ -1,8 +1,10 @@
 """
-Patent Intelligence MCP Server v0.2.0.
+Patent Intelligence MCP Server v0.3.0.
 Gibt AI-Agents Zugriff auf US-Patentdaten über die USPTO PatentsView API.
-10 Tools: Suche, Details, Erfinder, Assignee, Zitationen, Trends,
-CPC-Suche, Neueste Patente, Portfolio-Vergleich, Technologie-Landschaft.
+16 Tools: Suche, Details, Erfinder, Assignee, Zitationen, Trends,
+CPC-Suche, Neueste Patente, Portfolio-Vergleich, Technologie-Landschaft,
+IPC/CPC-Klassifikation, Patent-Familien, Top-Holder, Claims,
+Landschaftsanalyse mit Insights, kategoriebasierte Monitoring.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -18,6 +20,12 @@ from src.tools.patents import (
     search_recent_patents,
     compare_portfolios,
     get_patent_landscape,
+    # Neue Tools v0.3.0
+    search_by_classification,
+    get_patent_family,
+    get_top_patent_holders,
+    analyze_patent_landscape,
+    get_patent_claims,
 )
 
 # Server erstellen
@@ -25,10 +33,11 @@ mcp = FastMCP(
     "Patent Intelligence",
     instructions=(
         "Gibt AI-Agents Zugriff auf US-Patentdaten: "
-        "Patent-Suche (mit Datumsfilter), Erfinder-Lookup, Firmen-Portfolios, "
-        "Zitationsnetzwerke, Technologie-Trendanalysen, CPC-Klassifikations-Suche, "
-        "Portfolio-Vergleiche und Technologie-Landschaften. "
-        "10 Tools für umfassende Patent-Intelligence. "
+        "Patent-Suche, Erfinder-Lookup, Firmen-Portfolios, "
+        "Zitationsnetzwerke, Technologie-Trendanalysen, IPC/CPC-Klassifikationssuche, "
+        "Patent-Familien, Patentansprüche (Claims), Top-Patentinhaber-Rankings, "
+        "Portfolio-Vergleiche, Technologie-Landschaften und strategische Landschaftsanalysen. "
+        "16 Tools für umfassende Patent-Intelligence. "
         "Nutzt die kostenlose USPTO PatentsView API."
     ),
 )
@@ -43,11 +52,18 @@ mcp.tool()(search_by_assignee)
 mcp.tool()(get_patent_citations)
 mcp.tool()(analyze_technology_trends)
 
-# Neue Tools v0.2.0
+# Tools v0.2.0
 mcp.tool()(search_by_cpc)
 mcp.tool()(search_recent_patents)
 mcp.tool()(compare_portfolios)
 mcp.tool()(get_patent_landscape)
+
+# Neue Tools v0.3.0
+mcp.tool()(search_by_classification)
+mcp.tool()(get_patent_family)
+mcp.tool()(get_top_patent_holders)
+mcp.tool()(analyze_patent_landscape)
+mcp.tool()(get_patent_claims)
 
 
 def main():

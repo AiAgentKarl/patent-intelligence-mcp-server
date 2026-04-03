@@ -1,7 +1,8 @@
 """
 Async HTTP-Client für Patent-APIs.
 Nutzt USPTO PatentsView API (kostenlos, kein Key) als Hauptquelle.
-v0.2.0: Parallele Requests, In-Memory-Cache, erweiterte Suchmethoden.
+v0.3.0: 16 Tools — Patent-Familien, Claims, Top-Holder, erweiterte Landschaft,
+Klassifikationssuche (IPC/CPC mit Subgroup), Kategorie-Filter.
 """
 
 import asyncio
@@ -531,6 +532,259 @@ class PatentClient:
             results = await asyncio.gather(*tasks)
 
         return sorted(results, key=lambda x: x["year"])
+
+    # === Neue Methoden v0.3.0 ===
+
+    async def search_by_classification(
+        self, ipc_code: str, limit: int = 10
+    ) -> dict[str, Any]:
+        """
+        Sucht Patente nach IPC/CPC Klassifikation auf Subgroup-Ebene.
+        Erlaubt praezisere Suche als search_by_cpc (nutzt cpc_subgroup_id).
+        z.B. "H04L" (Netzwerk), "A61K" (Pharma), "G06N" (ML/AI).
+        """
+        limit = min(limit, settings.MAX_LIMIT)
+        code = ipc_code.strip().upper()
+
+        # Je nach Code-Laenge verschiedene Felder nutzen
+        if len(code) <= 1:
+            q = {"cpc_section_id": code}
+        elif len(code) <= 3:
+            q = {"cpc_subsection_id": code}
+        elif len(code) <= 4:
+            # Group-Ebene, z.B. "H04L"
+            q = {"_text_any": {"cpc_group_id": code}}
+        else:
+            # Subgroup-Ebene, z.B. "H04L9" oder "H04L9/32"
+            q = {"_text_any": {"cpc_subgroup_id": code}}
+
+        payload = {
+            "q": q,
+            "f": [
+                "patent_number",
+                "patent_title",
+                "patent_date",
+                "patent_abstract",
+                "cpc_section_id",
+                "cpc_subsection_id",
+                "cpc_subsection_title",
+                "cpc_group_id",
+                "cpc_group_title",
+                "cpc_subgroup_id",
+                "cpc_subgroup_title",
+                "patent_num_claims",
+                "assignee_organization",
+            ],
+            "o": {
+                "page": 1,
+                "per_page": limit,
+                "matched_subentities_only": True,
+            },
+            "s": [{"patent_date": "desc"}],
+        }
+
+        async with self._get_client() as client:
+            return await self._post(client, "/cpc_subsections/query", payload)
+
+    async def get_patent_family(
+        self, patent_number: str
+    ) -> dict[str, Any]:
+        """
+        Findet verwandte Patente in derselben Patent-Familie.
+        Nutzt Application-Number und Zitationen um Continuations,
+        Divisionals und verwandte Anmeldungen zu finden.
+        """
+        clean_number = patent_number.strip().replace("-", "").replace(" ", "")
+
+        # Basis-Patent-Daten mit Application-Info holen
+        base_payload = {
+            "q": {"patent_number": clean_number},
+            "f": [
+                "patent_number",
+                "patent_title",
+                "patent_date",
+                "patent_type",
+                "patent_kind",
+                "app_number",
+                "app_date",
+                "patent_firstnamed_assignee_city",
+                "patent_firstnamed_assignee_country",
+                "assignee_organization",
+            ],
+            "o": {"matched_subentities_only": True},
+        }
+
+        # Verwandte Patente ueber Zitationen (gleicher Assignee)
+        cited_payload = {
+            "q": {"patent_number": clean_number},
+            "f": [
+                "cited_patent_number",
+                "cited_patent_title",
+                "cited_patent_date",
+                "cited_patent_category",
+            ],
+            "o": {"per_page": 100},
+        }
+
+        # Patente die dieses zitieren
+        citing_payload = {
+            "q": {"cited_patent_number": clean_number},
+            "f": [
+                "patent_number",
+                "patent_title",
+                "patent_date",
+                "patent_type",
+                "patent_kind",
+                "assignee_organization",
+            ],
+            "o": {"per_page": 50},
+            "s": [{"patent_date": "desc"}],
+        }
+
+        async with self._get_client() as client:
+            base_data, cited_data, citing_data = await asyncio.gather(
+                self._post(client, "/patents/query", base_payload),
+                self._safe_post(client, "/patents/query", cited_payload),
+                self._safe_post(client, "/patents/query", citing_payload),
+            )
+
+            return {
+                "patent_number": clean_number,
+                "base_patent": base_data,
+                "cited_patents": cited_data or {},
+                "citing_patents": citing_data or {},
+            }
+
+    async def get_top_patent_holders(
+        self,
+        limit: int = 20,
+        sector_query: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Holt die Top-Patentinhaber. Optional gefiltert nach Technologie-Sektor.
+        """
+        limit = min(limit, settings.MAX_LIMIT)
+
+        # Wenn Sektor angegeben, filtern wir nach Suchbegriffen
+        if sector_query:
+            q: dict = {
+                "_or": [
+                    {"_text_any": {"patent_title": sector_query}},
+                    {"_text_any": {"patent_abstract": sector_query}},
+                ]
+            }
+        else:
+            # Ohne Filter: alle Assignees nach Gesamtpatenten sortiert
+            q = {"_gte": {"assignee_total_num_patents": 1}}
+
+        payload = {
+            "q": q,
+            "f": [
+                "assignee_organization",
+                "assignee_total_num_patents",
+                "assignee_country",
+                "assignee_type",
+            ],
+            "o": {
+                "page": 1,
+                "per_page": limit,
+            },
+            "s": [{"assignee_total_num_patents": "desc"}],
+        }
+
+        async with self._get_client() as client:
+            return await self._post(client, "/assignees/query", payload)
+
+    async def get_patent_claims(
+        self, patent_number: str
+    ) -> dict[str, Any]:
+        """
+        Holt die Claims (Patentansprueche) eines Patents.
+        Claims sind der rechtlich bindende Teil eines Patents.
+        """
+        clean_number = patent_number.strip().replace("-", "").replace(" ", "")
+
+        payload = {
+            "q": {"patent_number": clean_number},
+            "f": [
+                "patent_number",
+                "patent_title",
+                "patent_date",
+                "patent_abstract",
+                "patent_num_claims",
+                "claim_text",
+                "claim_number",
+                "claim_sequence",
+            ],
+            "o": {
+                "matched_subentities_only": True,
+                "per_page": 100,
+            },
+        }
+
+        async with self._get_client() as client:
+            return await self._post(client, "/patents/query", payload)
+
+    async def get_landscape_cpc_distribution(
+        self, query: str, limit: int = 10
+    ) -> dict[str, Any]:
+        """
+        Holt die CPC-Verteilung fuer eine Technologie-Suche.
+        Zeigt in welchen Klassifikationen die meisten Patente liegen.
+        """
+        limit = min(limit, settings.MAX_LIMIT)
+
+        payload = {
+            "q": {
+                "_or": [
+                    {"_text_any": {"patent_title": query}},
+                    {"_text_any": {"patent_abstract": query}},
+                ]
+            },
+            "f": [
+                "cpc_subsection_id",
+                "cpc_subsection_title",
+                "cpc_total_num_patents",
+            ],
+            "o": {
+                "page": 1,
+                "per_page": limit,
+            },
+            "s": [{"cpc_total_num_patents": "desc"}],
+        }
+
+        async with self._get_client() as client:
+            return await self._safe_post(client, "/cpc_subsections/query", payload)
+
+    async def get_landscape_country_distribution(
+        self, query: str, limit: int = 10
+    ) -> dict[str, Any]:
+        """
+        Holt die geografische Verteilung der Assignees fuer eine Technologie.
+        """
+        limit = min(limit, settings.MAX_LIMIT)
+
+        payload = {
+            "q": {
+                "_or": [
+                    {"_text_any": {"patent_title": query}},
+                    {"_text_any": {"patent_abstract": query}},
+                ]
+            },
+            "f": [
+                "assignee_organization",
+                "assignee_country",
+                "assignee_total_num_patents",
+            ],
+            "o": {
+                "page": 1,
+                "per_page": limit,
+            },
+            "s": [{"assignee_total_num_patents": "desc"}],
+        }
+
+        async with self._get_client() as client:
+            return await self._safe_post(client, "/assignees/query", payload)
 
 
 # Globale Client-Instanz
